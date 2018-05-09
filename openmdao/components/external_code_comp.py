@@ -37,11 +37,11 @@ class ExternalCodeComp(ExplicitComponent):
         Exit status of the child process.
     """
 
-    def __init__(self):
+    def __init__(self, **kwargs):
         """
         Intialize the ExternalCodeComp component.
         """
-        super(ExternalCodeComp, self).__init__()
+        super(ExternalCodeComp, self).__init__(**kwargs)
 
         self.STDOUT = STDOUT
         self.DEV_NULL = DEV_NULL
