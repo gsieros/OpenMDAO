@@ -88,6 +88,13 @@ class BoundsEnforceLS(NonlinearSolver):
                     desc="Set to True to print out names and values of variables that are pulled "
                     "back to their bounds.")
 
+        # Remove unused options from base options here, so that users
+        # attempting to set them will get KeyErrors.
+        opt.undeclare("atol")
+        opt.undeclare("rtol")
+        opt.undeclare("maxiter")
+        opt.undeclare("err_on_maxiter")
+
     def _run_iterator(self):
         """
         Run the iterative solver.

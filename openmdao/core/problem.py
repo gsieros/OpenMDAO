@@ -5,6 +5,7 @@ from __future__ import division, print_function
 import sys
 
 from collections import OrderedDict, defaultdict, namedtuple
+from fnmatch import fnmatchcase
 from itertools import product
 
 from six import iteritems, iterkeys, itervalues
@@ -176,7 +177,7 @@ class Problem(object):
                 proms = self.model._var_allprocs_prom2abs_list
                 meta = self.model._var_abs2meta
                 if name in meta:
-                    if name in self.model._conn_abs_in2out:
+                    if isinstance(self.model, Group) and name in self.model._conn_abs_in2out:
                         src_name = self.model._conn_abs_in2out[name]
                         val = meta[src_name]['value']
                     else:
@@ -184,7 +185,7 @@ class Problem(object):
 
                 elif name in proms['input']:
                     abs_name = proms['input'][name][0]
-                    if abs_name in self.model._conn_abs_in2out:
+                    if isinstance(self.model, Group) and abs_name in self.model._conn_abs_in2out:
                         src_name = self.model._conn_abs_in2out[abs_name]
                         # So, if the inputs and outputs are promoted to the same name, then we
                         # allow getitem, but if they aren't, then we raise an error due to non
@@ -494,8 +495,9 @@ class Problem(object):
         """
         self.driver.cleanup()
 
-    def setup(self, vector_class=DefaultVector, check=False, logger=None, mode='rev',
-              force_alloc_complex=False):
+    def setup(self, vector_class=None, check=False, logger=None, mode='rev',
+              force_alloc_complex=False, distributed_vector_class=PETScVector,
+              local_vector_class=DefaultVector):
         """
         Set up the model hierarchy.
 
@@ -507,7 +509,8 @@ class Problem(object):
         Parameters
         ----------
         vector_class : type
-            reference to an actual <Vector> class; not an instance.
+            Reference to an actual <Vector> class; not an instance. This is deprecated. Use
+            distributed_vector_class instead.
         check : boolean
             whether to run config check after setup is complete.
         logger : object
@@ -519,6 +522,12 @@ class Problem(object):
             Force allocation of imaginary part in nonlinear vectors. OpenMDAO can generally
             detect when you need to do this, but in some cases (e.g., complex step is used
             after a reconfiguration) you may need to set this to True.
+        distributed_vector_class : type
+            Reference to the <Vector> class or factory function used to instantiate vectors
+            and associated transfers involved in interprocess communication.
+        local_vector_class : type
+            Reference to the <Vector> class or factory function used to instantiate vectors
+            and associated transfers involved in intraprocess communication.
 
         Returns
         -------
@@ -528,12 +537,20 @@ class Problem(object):
         model = self.model
         comm = self.comm
 
+        if vector_class is not None:
+            warn_deprecation("'vector_class' has been deprecated. Use "
+                             "'distributed_vector_class' and/or 'local_vector_class' instead.")
+            distributed_vector_class = vector_class
+
         # PETScVector is required for MPI
-        if PETScVector and comm.size > 1 and vector_class is not PETScVector:
-            msg = ("The `vector_class` argument must be `PETScVector` when "
-                   "running in parallel under MPI but '%s' was specified."
-                   % vector_class.__name__)
-            raise ValueError(msg)
+        if comm.size > 1:
+            if PETScVector is None:
+                raise ValueError("Attempting to run in parallel under MPI but PETScVector could not"
+                                 "be imported.")
+            elif distributed_vector_class is not PETScVector:
+                raise ValueError("The `distributed_vector_class` argument must be `PETScVector` "
+                                 "when running in parallel under MPI but '%s' was specified."
+                                 % distributed_vector_class.__name__)
 
         if mode not in ['fwd', 'rev']:
             msg = "Unsupported mode: '%s'. Use either 'fwd' or 'rev'." % mode
@@ -543,10 +560,9 @@ class Problem(object):
 
         model_comm = self.driver._setup_comm(comm)
 
-        model._setup(model_comm, 'full', mode)
+        model._setup(model_comm, 'full', mode, distributed_vector_class, local_vector_class)
 
         # Cache all args for final setup.
-        self._vector_class = vector_class
         self._check = check
         self._logger = logger
         self._force_alloc_complex = force_alloc_complex
@@ -565,17 +581,9 @@ class Problem(object):
         are created and populated, the drivers and solvers are initialized, and the recorders are
         started, and the rest of the framework is prepared for execution.
         """
-        vector_class = self._vector_class
-        force_alloc_complex = self._force_alloc_complex
-
-        self._tot_jac_info_cache = defaultdict(lambda: None)
-
-        comm = self.comm
-        mode = self._mode
-
         if self._setup_status < 2:
-            self.model._final_setup(comm, vector_class, 'full',
-                                    force_alloc_complex=force_alloc_complex)
+            self.model._final_setup(self.comm, 'full',
+                                    force_alloc_complex=self._force_alloc_complex)
 
         self.driver._setup_driver(self)
 
@@ -583,7 +591,7 @@ class Problem(object):
         for items in self._solver_print_cache:
             self.set_solver_print(level=items[0], depth=items[1], type_=items[2])
 
-        if self._check and comm.rank == 0:
+        if self._check and self.comm.rank == 0:
             check_config(self, self._logger)
 
         if self._setup_status < 2:
@@ -608,23 +616,26 @@ class Problem(object):
                 return False
         return True
 
-    def check_partials(self, out_stream=_DEFAULT_OUT_STREAM, comps=None, compact_print=False,
-                       abs_err_tol=1e-6, rel_err_tol=1e-6,
-                       method='fd', step=None, form=DEFAULT_FD_OPTIONS['form'],
+    def check_partials(self, out_stream=_DEFAULT_OUT_STREAM, includes=None, excludes=None,
+                       compact_print=False, abs_err_tol=1e-6, rel_err_tol=1e-6,
+                       method='fd', step=DEFAULT_FD_OPTIONS['step'],
+                       form=DEFAULT_FD_OPTIONS['form'],
                        step_calc=DEFAULT_FD_OPTIONS['step_calc'],
-                       force_dense=True, suppress_output=False,
-                       show_only_incorrect=False):
+                       force_dense=True, show_only_incorrect=False):
         """
         Check partial derivatives comprehensively for all components in your model.
 
         Parameters
         ----------
         out_stream : file-like object
-            Where to send human readable output. Default is None.
+            Where to send human readable output. By default it goes to stdout.
             Set to None to suppress.
-        comps : None or list_like
-            List of component names to check the partials of (all others will be skipped). Set to
-             None (default) to run all components.
+        includes : None or list_like
+            List of glob patterns for pathnames to include in the check. Default is None, which
+            includes all components in the model.
+        excludes : None or list_like
+            List of glob patterns for pathnames to exclude from the check. Default is None, which
+            excludes nothing.
         compact_print : bool
             Set to True to just print the essentials, one line per unknown-param pair.
         abs_err_tol : float
@@ -637,18 +648,15 @@ class Problem(object):
         method : str
             Method, 'fd' for finite difference or 'cs' for complex step. Default is 'fd'.
         step : float
-            Step size for approximation. Default is None.
+            Step size for approximation. Default is the default value of step for the 'fd' method.
         form : string
-            Form for finite difference, can be 'forward', 'backward', or 'central'. The
-            default value is the value of DEFAULT_FD_OPTIONS['form']. Default is
-            the value of DEFAULT_FD_OPTIONS['form']
+            Form for finite difference, can be 'forward', 'backward', or 'central'. Default
+            is the default value of step for the 'fd' method.
         step_calc : string
             Step type for finite difference, can be 'abs' for absolute', or 'rel' for
-            relative. The default value is the value of DEFAULT_FD_OPTIONS['step_calc']
+            relative. Default is the default value of step for the 'fd' method.
         force_dense : bool
             If True, analytic derivatives will be coerced into arrays. Default is True.
-        suppress_output : bool
-            Set to True to suppress all output. Default is False.
         show_only_incorrect : bool, optional
             Set to True if output should print only the subjacs found to be incorrect.
 
@@ -675,16 +683,35 @@ class Problem(object):
         # TODO: Once we're tracking iteration counts, run the model if it has not been run before.
 
         all_comps = model.system_iter(typ=Component, include_self=True)
-        if comps is None:
-            comps = [comp for comp in all_comps]
-        else:
-            all_comp_names = {c.pathname for c in all_comps}
-            requested = set(comps)
-            extra = requested.difference(all_comp_names)
-            if extra:
-                msg = 'The following are not valid comp names: {}'.format(sorted(list(extra)))
-                raise ValueError(msg)
-            comps = [model._get_subsystem(c_name) for c_name in comps]
+        includes = [includes] if isinstance(includes, str) else includes
+        excludes = [excludes] if isinstance(excludes, str) else excludes
+
+        comps = []
+        for comp in all_comps:
+            if isinstance(comp, IndepVarComp):
+                continue
+
+            name = comp.pathname
+
+            # Process includes
+            if includes is not None:
+                for pattern in includes:
+                    if fnmatchcase(name, pattern):
+                        break
+                else:
+                    continue
+
+            # Process excludes
+            if excludes is not None:
+                match = False
+                for pattern in excludes:
+                    if fnmatchcase(name, pattern):
+                        match = True
+                        break
+                if match:
+                    continue
+
+            comps.append(comp)
 
         self.set_solver_print(level=0)
 
@@ -711,10 +738,6 @@ class Problem(object):
             for comp in comps:
 
                 comp.run_linearize()
-
-                # Skip IndepVarComps
-                if isinstance(comp, IndepVarComp):
-                    continue
 
                 explicit = isinstance(comp, ExplicitComponent)
                 matrix_free = comp.matrix_free
@@ -871,10 +894,6 @@ class Problem(object):
         all_fd_options = {}
         for comp in comps:
 
-            # Skip IndepVarComps
-            if isinstance(comp, IndepVarComp):
-                continue
-
             c_name = comp.pathname
             all_fd_options[c_name] = {}
             explicit = isinstance(comp, ExplicitComponent)
@@ -956,21 +975,19 @@ class Problem(object):
         # Conversion of defaultdict to dicts
         partials_data = {comp_name: dict(outer) for comp_name, outer in iteritems(partials_data)}
 
-        if out_stream == _DEFAULT_OUT_STREAM and not suppress_output:
+        if out_stream == _DEFAULT_OUT_STREAM:
             out_stream = sys.stdout
 
         _assemble_derivative_data(partials_data, rel_err_tol, abs_err_tol, out_stream,
-                                  compact_print, comps, all_fd_options,
-                                  suppress_output=suppress_output, indep_key=indep_key,
+                                  compact_print, comps, all_fd_options, indep_key=indep_key,
                                   all_comps_provide_jacs=self._all_components_provide_jacobians(),
                                   show_only_incorrect=show_only_incorrect)
 
         return partials_data
 
     def check_totals(self, of=None, wrt=None, out_stream=_DEFAULT_OUT_STREAM, compact_print=False,
-                     abs_err_tol=1e-6,
-                     rel_err_tol=1e-6, method='fd', step=1e-6, form='forward', step_calc='abs',
-                     suppress_output=False):
+                     driver_scaling=False, abs_err_tol=1e-6, rel_err_tol=1e-6,
+                     method='fd', step=1e-6, form='forward', step_calc='abs'):
         """
         Check total derivatives for the model vs. finite difference.
 
@@ -983,10 +1000,13 @@ class Problem(object):
             Variables with respect to which the derivatives will be computed.
             Default is None, which uses the driver's desvars.
         out_stream : file-like object
-            Where to send human readable output. Default is None.
+            Where to send human readable output. By default it goes to stdout.
             Set to None to suppress.
         compact_print : bool
             Set to True to just print the essentials, one line per unknown-param pair.
+        driver_scaling : bool
+            Set to True to scale derivative values by the quantities specified when the desvars and
+            responses were added. Default if False, which is unscaled.
         abs_err_tol : float
             Threshold value for absolute error.  Errors about this value will have a '*' displayed
             next to them in output, making them easy to search for. Default is 1.0E-6.
@@ -1004,8 +1024,6 @@ class Problem(object):
         step_calc : string
             Step type for finite difference, can be 'abs' for absolute', or 'rel' for relative.
             Default is 'abs'.
-        suppress_output : bool
-            Set to True to suppress all output. Default is False.
 
         Returns
         -------
@@ -1027,7 +1045,8 @@ class Problem(object):
         with self.model._scaled_context_all():
 
             # Calculate Total Derivatives
-            total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict')
+            total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict',
+                                       driver_scaling=driver_scaling)
             Jcalc = total_info.compute_totals()
 
             # Approximate FD
@@ -1036,8 +1055,10 @@ class Problem(object):
                 'form': form,
                 'step_calc': step_calc,
             }
-            model.approx_totals(method=method, **fd_args)
-            total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict', approx=True)
+            model.approx_totals(method=method, step=step, form=form,
+                                step_calc=step_calc if method is 'fd' else None)
+            total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict', approx=True,
+                                       driver_scaling=driver_scaling)
             Jfd = total_info.compute_totals_approx(initialize=True)
 
         # Assemble and Return all metrics.
@@ -1049,15 +1070,15 @@ class Problem(object):
             data[''][key]['J_fd'] = Jfd[key]
         fd_args['method'] = 'fd'
 
-        if out_stream == _DEFAULT_OUT_STREAM and not suppress_output:
+        if out_stream == _DEFAULT_OUT_STREAM:
             out_stream = sys.stdout
 
         _assemble_derivative_data(data, rel_err_tol, abs_err_tol, out_stream, compact_print,
-                                  [model],
-                                  {'': fd_args}, totals=True, suppress_output=suppress_output)
+                                  [model], {'': fd_args}, totals=True)
         return data['']
 
-    def compute_totals(self, of=None, wrt=None, return_format='flat_dict', debug_print=False):
+    def compute_totals(self, of=None, wrt=None, return_format='flat_dict', debug_print=False,
+                       driver_scaling=False):
         """
         Compute derivatives of desired quantities with respect to desired inputs.
 
@@ -1075,6 +1096,9 @@ class Problem(object):
             tuples of form (of, wrt).
         debug_print : bool
             Set to True to print out some debug information during linear solve.
+        driver_scaling : bool
+            Set to True to scale derivative values by the quantities specified when the desvars and
+            responses were added. Default if False, which is unscaled.
 
         Returns
         -------
@@ -1086,11 +1110,12 @@ class Problem(object):
 
         with self.model._scaled_context_all():
             if self.model._owns_approx_jac:
-                total_info = _TotalJacInfo(self, of, wrt, False, return_format, approx=True)
+                total_info = _TotalJacInfo(self, of, wrt, False, return_format,
+                                           approx=True, driver_scaling=driver_scaling)
                 return total_info.compute_totals_approx(initialize=True)
             else:
                 total_info = _TotalJacInfo(self, of, wrt, False, return_format,
-                                           debug_print=debug_print)
+                                           debug_print=debug_print, driver_scaling=driver_scaling)
                 return total_info.compute_totals()
 
     def set_solver_print(self, level=2, depth=1e99, type_='all'):
@@ -1278,10 +1303,35 @@ class Problem(object):
 
         print()
 
+    def load_case(self, case):
+        """
+        Pull all input and output variables from a case into the model.
+
+        Parameters
+        ----------
+        case : Case object
+            A Case from a CaseRecorder file.
+        """
+        inputs = case.inputs._values if case.inputs is not None else None
+        for name, val in zip(inputs.dtype.names, inputs):
+            if name not in self.model._var_abs_names['input']:
+                raise KeyError("Input variable, '{}', recorded in the case is not "
+                               "found in the model".format(name))
+            self[name] = val
+
+        outputs = case.outputs._values if case.outputs is not None else None
+        for name, val in zip(outputs.dtype.names, outputs):
+            if name not in self.model._var_abs_names['output']:
+                raise KeyError("Output variable, '{}', recorded in the case is not "
+                               "found in the model".format(name))
+            self[name] = val
+
+        return
+
 
 def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out_stream,
                               compact_print, system_list, global_options, totals=False,
-                              suppress_output=False, indep_key=None, all_comps_provide_jacs=False,
+                              indep_key=None, all_comps_provide_jacs=False,
                               show_only_incorrect=False):
     """
     Compute the relative and absolute errors in the given derivatives and print to the out_stream.
@@ -1305,8 +1355,6 @@ def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out
         Dictionary containing the options for the approximation.
     totals : bool
         Set to True if we are doing check_totals to skip a bunch of stuff.
-    suppress_output : bool
-        Set to True to suppress all output. Just calculate errors and add the keys.
     indep_key : dict of sets, optional
         Keyed by component name, contains the of/wrt keys that are declared not dependent.
     all_comps_provide_jacs : bool, optional
@@ -1315,6 +1363,7 @@ def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out
         Set to True if output should print only the subjacs found to be incorrect.
     """
     nan = float('nan')
+    suppress_output = out_stream is None
 
     if compact_print:
         if totals:
@@ -1336,9 +1385,6 @@ def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out
                          'incorrect Jacobians **\n\n')
 
     for system in system_list:
-        # No need to see derivatives of IndepVarComps
-        if isinstance(system, IndepVarComp):
-            continue
 
         sys_name = system.pathname
         sys_class_name = type(system).__name__

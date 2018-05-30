@@ -137,6 +137,9 @@ def _check_dup_comp_inputs(problem, logger):
     logger : object
         The object that manages logging output.
     """
+    if isinstance(problem.model, Component):
+        return
+
     input_srcs = problem.model._conn_global_abs_in2out
     src2inps = defaultdict(list)
     for inp, src in iteritems(input_srcs):
@@ -174,7 +177,10 @@ def _check_hanging_inputs(problem, logger):
     logger : object
         The object that manages logging output.
     """
-    input_srcs = problem.model._conn_global_abs_in2out
+    if isinstance(problem.model, Component):
+        input_srcs = {}
+    else:
+        input_srcs = problem.model._conn_global_abs_in2out
 
     prom_ins = problem.model._var_allprocs_prom2abs_list['input']
     unconns = []
@@ -254,7 +260,7 @@ def _check_solvers(problem, logger):
             is_iter_nl = True
         else:
             is_iter_nl = (
-                (sys.nonlinear_solver and sys.nonlinear_solver.options['maxiter'] > 1) or
+                (sys.nonlinear_solver and 'maxiter' in sys.nonlinear_solver.options) or
                 (has_states and overrides_method('solve_nonlinear', sys, ImplicitComponent))
             )
             iter_nl_depth = depth if is_iter_nl else np.inf
@@ -263,7 +269,7 @@ def _check_solvers(problem, logger):
             is_iter_ln = True
         else:
             is_iter_ln = (
-                (sys.linear_solver and (sys.linear_solver.options['maxiter'] > 1 or
+                (sys.linear_solver and ('maxiter' in sys.linear_solver.options or
                  isinstance(sys.linear_solver, DirectSolver))) or
                 (has_states and overrides_method('solve_linear', sys, ImplicitComponent))
             )

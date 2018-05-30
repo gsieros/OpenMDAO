@@ -5,6 +5,7 @@ from __future__ import print_function, division
 
 from collections import OrderedDict
 from copy import deepcopy
+import pprint
 from six import iteritems
 from six.moves import zip
 import sys
@@ -72,7 +73,7 @@ class _TotalJacInfo(object):
     """
 
     def __init__(self, problem, of, wrt, global_names, return_format, approx=False,
-                 debug_print=False):
+                 debug_print=False, driver_scaling=True):
         """
         Initialize object.
 
@@ -93,6 +94,9 @@ class _TotalJacInfo(object):
             If True, the object will compute approx total jacobians.
         debug_print : bool
             Set to True to print out debug and timing information for each derivative solved.
+        driver_scaling : bool
+            If True (default), scale derivative values by the quantities specified when the desvars
+            and responses were added. If False, leave them unscaled.
         """
         driver = problem.driver
         prom2abs = problem.model._var_allprocs_prom2abs_list['output']
@@ -102,7 +106,7 @@ class _TotalJacInfo(object):
         self.relevant = model._relevant
         self.mode = problem._mode
         self.owning_ranks = problem.model._owning_rank
-        self.has_scaling = driver._has_scaling
+        self.has_scaling = driver._has_scaling and driver_scaling
         self.return_format = return_format
         self.lin_sol_cache = {}
         self.design_vars = design_vars = driver._designvars
@@ -393,11 +397,16 @@ class _TotalJacInfo(object):
             # value before calling solve_linear.
             loc_i = np.full(irange.shape, -1, dtype=int)
             if gend > gstart:
-                loc = np.logical_and(irange >= gstart, irange < gend)
+                loc = np.nonzero(np.logical_and(irange >= gstart, irange < gend))[0]
                 if in_idxs is None:
-                    loc_i[loc] = np.arange(0, gend - gstart, dtype=int)[loc]
+                    if in_var_meta['distributed']:
+                        loc_i[loc] = np.arange(0, gend - gstart, dtype=int)
+                    else:
+                        loc_i[loc] = irange[loc] - gstart
                 else:
                     loc_i[loc] = irange[loc]
+                    if not in_var_meta['distributed']:
+                        loc_i[loc] -= gstart
 
             loc_idxs.append(loc_i)
 
@@ -425,13 +434,15 @@ class _TotalJacInfo(object):
             elif matmat:
                 if name not in idx_iter_dict:
                     idx_iter_dict[name] = (None, matmat,
-                                           [np.arange(start, end, dtype=int)], self.matmat_iter)
+                                           [np.arange(start, end, dtype=int)],
+                                           self.matmat_iter)
                 else:
                     raise RuntimeError("Variable name '%s' matches a parallel_deriv_color name." %
                                        name)
             elif not simul_coloring:  # plain old single index iteration
                 idx_iter_dict[name] = (None, False,
-                                       np.arange(start, end, dtype=int), self.single_index_iter)
+                                       np.arange(start, end, dtype=int),
+                                       self.single_index_iter)
 
             tup = (name, rhsname, rel, cache_lin_sol)
             idx_map.extend([tup] * (end - start))
@@ -1028,6 +1039,10 @@ class _TotalJacInfo(object):
         if self.has_scaling:
             self._do_scaling(self.J_dict)
 
+        if debug_print:
+            # Debug outputs scaled derivatives.
+            self._print_derivatives()
+
         recording_iteration.stack.pop()
 
         return self.J_final
@@ -1206,6 +1221,32 @@ class _TotalJacInfo(object):
         else:
             raise RuntimeError("Derivative scaling by the driver only supports the 'dict' and "
                                "'array' formats at present.")
+
+    def _print_derivatives(self):
+        """
+        Print out the derivatives when debug_print is True.
+        """
+        inputs = self.input_list
+        outputs = self.output_list
+        if self.return_format == 'dict':
+            J = self.J_dict
+            for of in inputs:
+                for wrt in outputs:
+                    pprint.pprint({(of, wrt): J[of][wrt]})
+
+        else:
+            abs2meta = self.model._var_allprocs_abs2meta
+            in_meta, in_size = self._get_tuple_map(self.input_list, self.input_meta, abs2meta)
+            out_meta = self.out_meta
+            J = self.J
+
+            for i, of in enumerate(outputs):
+                out_slice = out_meta[of][0]
+                for j, wrt in enumerate(inputs):
+                    pprint.pprint({(of, wrt): J[out_slice, in_meta[wrt][0]]})
+
+        print('')
+        sys.stdout.flush()
 
 
 def _get_subjac(jac, prom_out, prom_in, of_idx, wrt_idx):

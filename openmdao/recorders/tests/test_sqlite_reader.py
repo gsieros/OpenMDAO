@@ -4,18 +4,23 @@ from __future__ import print_function
 import errno
 import os
 import unittest
+import warnings
 from shutil import rmtree
 from tempfile import mkdtemp, mkstemp
 
 import numpy as np
+from six import iteritems, assertRaisesRegex
 
-from openmdao.test_suite.components.sellar import SellarDerivatives
-from openmdao.api import Problem, Group, IndepVarComp, ExecComp, NonlinearBlockGS, ScipyKrylov, LinearBlockGS
+
+from openmdao.api import Problem, Group, IndepVarComp, ExecComp, NonlinearBlockGS, ScipyKrylov, \
+    LinearBlockGS, ScipyOptimizeDriver, NewtonSolver
 from openmdao.recorders.sqlite_recorder import SqliteRecorder, format_version
 from openmdao.recorders.case_reader import CaseReader
 from openmdao.recorders.sqlite_reader import SqliteCaseReader
 from openmdao.recorders.recording_iteration_stack import recording_iteration
-from openmdao.test_suite.components.sellar import SellarDis1withDerivatives, \
+from openmdao.core.tests.test_units import SpeedComp
+from openmdao.test_suite.components.paraboloid import Paraboloid
+from openmdao.test_suite.components.sellar import SellarDerivatives, SellarDis1withDerivatives, \
     SellarDis2withDerivatives
 from openmdao.utils.assert_utils import assert_rel_error
 from openmdao.utils.general_utils import set_pyoptsparse_opt
@@ -42,14 +47,13 @@ if OPTIMIZER:
 class TestSqliteCaseReader(unittest.TestCase):
 
     def setup_sellar_model_with_optimization(self):
-        self.prob = Problem()
-        self.prob.model = SellarDerivatives()
+        self.prob = Problem(SellarDerivatives())
 
         optimizer = 'pyoptsparse'
         self.prob.driver = optimizers[optimizer]()
 
         self.prob.model.add_design_var('z', lower=np.array([-10.0, 0.0]),
-                                   upper=np.array([10.0, 10.0]))
+                                       upper=np.array([10.0, 10.0]))
         self.prob.model.add_design_var('x', lower=0.0, upper=10.0)
         self.prob.model.add_objective('obj')
         self.prob.model.add_constraint('con1', upper=0.0)
@@ -61,7 +65,7 @@ class TestSqliteCaseReader(unittest.TestCase):
     def setup_sellar_model(self):
         self.prob = Problem()
 
-        model = self.prob.model = Group()
+        model = self.prob.model
         model.add_subsystem('px', IndepVarComp('x', 1.0), promotes=['x'])
         model.add_subsystem('pz', IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
         model.add_subsystem('d1', SellarDis1withDerivatives(), promotes=['x', 'z', 'y1', 'y2'])
@@ -72,14 +76,15 @@ class TestSqliteCaseReader(unittest.TestCase):
 
         model.add_subsystem('con_cmp1', ExecComp('con1 = 3.16 - y1'), promotes=['con1', 'y1'])
         model.add_subsystem('con_cmp2', ExecComp('con2 = y2 - 24.0'), promotes=['con2', 'y2'])
-        self.prob.model.nonlinear_solver = NonlinearBlockGS()
-        self.prob.model.linear_solver = LinearBlockGS()
 
-        self.prob.model.add_design_var('z', lower=np.array([-10.0, 0.0]), upper=np.array([10.0, 10.0]))
-        self.prob.model.add_design_var('x', lower=0.0, upper=10.0)
-        self.prob.model.add_objective('obj')
-        self.prob.model.add_constraint('con1', upper=0.0)
-        self.prob.model.add_constraint('con2', upper=0.0)
+        model.nonlinear_solver = NonlinearBlockGS()
+        model.linear_solver = LinearBlockGS()
+
+        model.add_design_var('z', lower=np.array([-10.0, 0.0]), upper=np.array([10.0, 10.0]))
+        model.add_design_var('x', lower=0.0, upper=10.0)
+        model.add_objective('obj')
+        model.add_constraint('con1', upper=0.0)
+        model.add_constraint('con2', upper=0.0)
 
     def setup_sellar_grouped_model(self):
         self.prob = Problem()
@@ -193,6 +198,7 @@ class TestSqliteCaseReader(unittest.TestCase):
 
     def test_format_version(self):
         self.setup_sellar_model()
+        self.prob.model.add_recorder(self.recorder)
         self.prob.setup(check=False)
         self.prob.run_driver()
         self.prob.cleanup()
@@ -204,6 +210,7 @@ class TestSqliteCaseReader(unittest.TestCase):
     def test_reader_instantiates(self):
         """ Test that CaseReader returns an SqliteCaseReader. """
         self.setup_sellar_model()
+        self.prob.model.add_recorder(self.recorder)
         self.prob.setup(check=False)
         self.prob.run_driver()
         self.prob.cleanup()
@@ -212,8 +219,8 @@ class TestSqliteCaseReader(unittest.TestCase):
         self.assertTrue(isinstance(cr, SqliteCaseReader), msg='CaseReader not'
                         ' returning the correct subclass.')
 
-    @unittest.skipIf(OPT is None, "pyoptsparse is not installed" )
-    @unittest.skipIf(OPTIMIZER is None, "pyoptsparse is not providing SNOPT or SLSQP" )
+    @unittest.skipIf(OPT is None, "pyoptsparse is not installed")
+    @unittest.skipIf(OPTIMIZER is None, "pyoptsparse is not providing SNOPT or SLSQP")
     def test_reading_driver_cases(self):
         """ Tests that the reader returns params correctly. """
         self.setup_sellar_model_with_optimization()
@@ -353,26 +360,6 @@ class TestSqliteCaseReader(unittest.TestCase):
                              'rank0:Driver|0|root._solve_nonlinear|0|NonlinearBlockGS|{}'
                              .format(i))
 
-    @unittest.skipIf(OPT is None, "pyoptsparse is not installed")
-    @unittest.skipIf(OPTIMIZER is None, "pyoptsparse is not providing SNOPT or SLSQP")
-    def test_reading_driver_metadata(self):
-        self.setup_sellar_model_with_optimization()
-
-        self.prob.driver.recording_options['record_desvars'] = True
-        self.prob.driver.recording_options['record_responses'] = True
-        self.prob.driver.recording_options['record_objectives'] = True
-        self.prob.driver.recording_options['record_constraints'] = True
-        self.prob.driver.add_recorder(self.recorder)
-
-        self.prob.setup(check=False)
-        self.prob.run_driver()
-        self.prob.cleanup()
-
-        cr = CaseReader(self.filename)
-
-        self.assertEqual(len(cr.driver_metadata['connections_list']), 11)
-        self.assertEqual(len(cr.driver_metadata['tree']), 4)
-
     def test_reading_metadata(self):
         self.setup_sellar_model_with_units()
         self.prob.driver.add_recorder(self.recorder)
@@ -398,64 +385,11 @@ class TestSqliteCaseReader(unittest.TestCase):
         self.assertEqual(cr.output2meta['y2']['upper'], None)
         self.assertEqual(cr.output2meta['y2']['lower'], None)
 
-    def test_reading_system_metadata(self):
-
-        if OPT is None:
-            raise unittest.SkipTest("pyoptsparse is not installed")
-
-        if OPTIMIZER is None:
-            raise unittest.SkipTest("pyoptsparse is not providing SNOPT or SLSQP")
-
-        self.setup_sellar_grouped_scaled_model()
-
-        self.prob.driver = pyOptSparseDriver()
-        self.prob.driver.options['optimizer'] = OPTIMIZER
-        self.prob.model.metadata.declare("test1", 1)
-        self.prob.model.mda.d1.metadata.declare("test2", "2")
-        self.prob.model.pz.metadata.declare("test3", True)
-        self.prob.model.pz.recording_options['metadata_excludes'] = ['*']
-        if OPTIMIZER == 'SLSQP':
-            self.prob.driver.opt_settings['ACC'] = 1e-9
-
-        self.prob.model.recording_options['record_inputs'] = True
-        self.prob.model.recording_options['record_outputs'] = True
-        self.prob.model.recording_options['record_residuals'] = True
-        self.prob.model.recording_options['record_metadata'] = True
-
-        self.prob.model.add_recorder(self.recorder)
-
-        pz = self.prob.model.pz # IndepVarComp which is an ExplicitComponent
-        pz.add_recorder(self.recorder)
-
-        mda = self.prob.model.mda  # Group
-        d1 = mda.d1
-        d1.add_recorder(self.recorder)
-
-        self.prob.setup(check=False, mode='rev')
-
-        self.prob.run_driver()
-
-        self.prob.cleanup()
-
-        cr = CaseReader(self.filename)
-
-        self.assertEqual(
-                sorted(cr.system_metadata.keys()),
-                sorted(['root', 'mda.d1', 'pz'])
-        )
-
-        self.assertEqual(cr.system_metadata['root']['component_metadata']['test1'], 1)
-        self.assertEqual(cr.system_metadata['mda.d1']['component_metadata']['test2'], "2")
-        self.assertFalse('test3' in cr.system_metadata['pz']['component_metadata'])
-
-        assert_rel_error(
-            self, cr.system_metadata['pz']['scaling_factors']['output']['nonlinear']['phys'][0][1], [2.0, 2.0], 1.0e-3)
-
     def test_reading_solver_metadata(self):
         self.setup_sellar_model()
 
         nonlinear_solver = self.prob.model.nonlinear_solver
-        self.prob.model.nonlinear_solver.add_recorder(self.recorder)
+        nonlinear_solver.add_recorder(self.recorder)
 
         linear_solver = self.prob.model.linear_solver
         linear_solver.add_recorder(self.recorder)
@@ -472,15 +406,15 @@ class TestSqliteCaseReader(unittest.TestCase):
         cr = CaseReader(self.filename)
 
         self.assertEqual(
-                sorted(cr.solver_metadata.keys()),
-                sorted(['root.LinearBlockGS', 'root.NonlinearBlockGS', 'd1.NonlinearBlockGS'])
+            sorted(cr.solver_metadata.keys()),
+            sorted(['root.LinearBlockGS', 'root.NonlinearBlockGS', 'd1.NonlinearBlockGS'])
         )
         self.assertEqual(cr.solver_metadata['d1.NonlinearBlockGS']['solver_options']['maxiter'], 5)
         self.assertEqual(cr.solver_metadata['root.NonlinearBlockGS']['solver_options']['maxiter'],10)
         self.assertEqual(cr.solver_metadata['root.LinearBlockGS']['solver_class'],'LinearBlockGS')
 
-    @unittest.skipIf(OPT is None, "pyoptsparse is not installed" )
-    @unittest.skipIf(OPTIMIZER is None, "pyoptsparse is not providing SNOPT or SLSQP" )
+    @unittest.skipIf(OPT is None, "pyoptsparse is not installed")
+    @unittest.skipIf(OPTIMIZER is None, "pyoptsparse is not providing SNOPT or SLSQP")
     def test_reading_driver_recording_with_system_vars(self):
 
         self.setup_sellar_grouped_model()
@@ -695,13 +629,10 @@ class TestSqliteCaseReader(unittest.TestCase):
             np.testing.assert_almost_equal(vals['resids'], expected['resids'])
             np.testing.assert_almost_equal(vals['value'], expected['values'])
 
-        expected_explicit_outputs_case = expected_outputs_case
-        expl_outputs_case = cr.list_outputs(sys_case, True, False, True, True, None, True, True, True,
-                                            True, True, True)
         for o in outputs_case:
             vals = o[1]
             name = o[0]
-            expected = expected_explicit_outputs_case[name]
+            expected = expected_outputs_case[name]
             self.assertEqual(vals['lower'], expected['lower'])
             self.assertEqual(vals['ref'], expected['ref'])
             self.assertEqual(vals['shape'], expected['shape'])
@@ -713,9 +644,6 @@ class TestSqliteCaseReader(unittest.TestCase):
 
     def test_list_inputs(self):
         self.setup_sellar_model()
-
-        nonlinear_solver = self.prob.model.nonlinear_solver
-        linear_solver = self.prob.model.linear_solver
 
         d1 = self.prob.model.d1  # instance of SellarDis1withDerivatives, a Group
         d1.nonlinear_solver = NonlinearBlockGS()
@@ -795,22 +723,336 @@ class TestSqliteCaseReader(unittest.TestCase):
             "z": [5., 2.]
         }
 
-        expected_objectives = { "obj": [28.58830817], }
+        expected_objectives = {"obj": [28.58830817], }
 
-        expected_constraints = { "con1": [-22.42830237], "con2": [-11.94151185] }
+        expected_constraints = {"con1": [-22.42830237], "con2": [-11.94151185]}
 
         expected_responses = expected_objectives.copy()
         expected_responses.update(expected_constraints)
 
-        for expected_set, actual_set in (
-            (expected_desvars, desvars),
-            (expected_objectives, objectives),
-            (expected_constraints, constraints),
-            (expected_responses, responses)):
-            
+        for expected_set, actual_set in ((expected_desvars, desvars),
+                                         (expected_objectives, objectives),
+                                         (expected_constraints, constraints),
+                                         (expected_responses, responses)):
+
             self.assertEqual(len(expected_set), len(actual_set.keys))
             for k in actual_set:
-                np.testing.assert_almost_equal(expected_set[k], actual_set[k])   
+                np.testing.assert_almost_equal(expected_set[k], actual_set[k])
+
+    def test_simple_load_system_cases(self):
+        self.setup_sellar_model()
+        prob = self.prob
+        model = prob.model
+        model.recording_options['record_inputs'] = True
+        model.recording_options['record_outputs'] = True
+        model.recording_options['record_residuals'] = True
+        model.add_recorder(self.recorder)
+        prob.setup(check=False)
+        prob.run_driver()
+        prob.cleanup()
+
+        cr = CaseReader(self.filename)
+        case = cr.system_cases.get_case(0)
+
+        # Add one to all the inputs and outputs just to change the model
+        #   so we can see if loading the case values really changes the model
+        for name in model._inputs:
+            model._inputs[name] += 1.0
+        for name in model._outputs:
+            model._outputs[name] += 1.0
+
+        # Now load in the case we recorded
+        prob.load_case(case)
+
+        _assert_model_matches_case(case, model)
+
+    def test_load_bad_system_case(self):
+        self.setup_sellar_grouped_model()
+        prob = self.prob
+        model = prob.model
+        driver = prob.driver = ScipyOptimizeDriver()
+        driver.options['optimizer'] = 'SLSQP'
+        driver.options['tol'] = 1e-9
+        driver.options['disp'] = False
+
+        model.add_recorder(self.recorder)
+        driver.recording_options['record_desvars'] = True
+        driver.recording_options['record_responses'] = True
+        driver.recording_options['record_objectives'] = True
+        driver.recording_options['record_constraints'] = True
+
+        prob.setup(check=False)
+        prob.run_driver()
+        prob.cleanup()
+
+        cr = CaseReader(self.filename)
+        case = cr.system_cases.get_case(0)
+
+        # try to load it into a completely different model
+        self.setup_sellar_model()
+        prob = self.prob
+        prob.setup(check=False)
+
+        error_msg = "Input variable, '[^']+', recorded in the case is not found in the model"
+        with assertRaisesRegex(self, KeyError, error_msg):
+            prob.load_case(case)
+
+    def test_subsystem_load_system_cases(self):
+        self.setup_sellar_model()
+        prob = self.prob
+        model = prob.model
+        model.recording_options['record_inputs'] = True
+        model.recording_options['record_outputs'] = True
+        model.recording_options['record_residuals'] = True
+
+        # Only record a subsystem
+        d2 = model._get_subsystem('d2')
+        d2.add_recorder(self.recorder)
+        prob.setup(check=False)
+        prob.run_driver()
+        prob.cleanup()
+
+        cr = CaseReader(self.filename)
+        case = cr.system_cases.get_case(0)
+
+        # Add one to all the inputs just to change the model
+        #   so we can see if loading the case values really changes the model
+        for name in self.prob.model._inputs:
+            model._inputs[name] += 1.0
+        for name in self.prob.model._outputs:
+            model._outputs[name] += 1.0
+
+        # Now load in the case we recorded
+        prob.load_case(case)
+
+        _assert_model_matches_case(case, d2)
+
+    def test_load_system_cases_with_units(self):
+
+        comp = IndepVarComp()
+        comp.add_output('distance', val=1., units='m')
+        comp.add_output('time', val=1., units='s')
+
+        prob = Problem(model=Group())
+        model = prob.model
+        model.add_subsystem('c1', comp)
+        model.add_subsystem('c2', SpeedComp())
+        model.add_subsystem('c3', ExecComp('f=speed',speed={'units': 'm/s'}))
+        model.connect('c1.distance', 'c2.distance')
+        model.connect('c1.time', 'c2.time')
+        model.connect('c2.speed', 'c3.speed')
+
+        model.add_recorder(self.recorder)
+
+        prob.setup()
+        prob.run_model()
+
+        cr = CaseReader(self.filename)
+        case = cr.system_cases.get_case(0)
+
+        # Add one to all the inputs just to change the model
+        #   so we can see if loading the case values really changes the model
+        for name in model._inputs:
+            model._inputs[name] += 1.0
+        for name in model._outputs:
+            model._outputs[name] += 1.0
+
+        # Now load in the case we recorded
+        prob.load_case(case)
+
+        _assert_model_matches_case(case, model)
+
+    def test_optimization_load_system_cases(self):
+
+        self.setup_sellar_grouped_model()
+        prob = self.prob
+        model = prob.model
+        driver = prob.driver = ScipyOptimizeDriver()
+        driver.options['optimizer'] = 'SLSQP'
+        driver.options['tol'] = 1e-9
+        driver.options['disp'] = False
+
+        model.add_recorder(self.recorder)
+        driver.recording_options['record_desvars'] = True
+        driver.recording_options['record_responses'] = True
+        driver.recording_options['record_objectives'] = True
+        driver.recording_options['record_constraints'] = True
+
+        prob.setup(check=False)
+        prob.run_driver()
+        prob.cleanup()
+
+        inputs_before = model.list_inputs(values=True, units=True)
+        outputs_before = model.list_outputs(values=True, units=True)
+
+        cr = CaseReader(self.filename)
+        # get third case
+        third_case = cr.system_cases.get_case(2)
+
+        iter_count_before = driver.iter_count
+
+        # run the model again with a fresh model
+        self.setup_sellar_grouped_model()
+
+        prob = self.prob
+        model = prob.model
+        driver = prob.driver = ScipyOptimizeDriver()
+        driver.options['optimizer'] = 'SLSQP'
+        driver.options['tol'] = 1e-9
+        driver.options['disp'] = False
+
+        prob.setup(check=False)
+        prob.load_case(third_case)
+        prob.run_driver()
+        prob.cleanup()
+
+        inputs_after = model.list_inputs(values=True, units=True)
+        outputs_after = model.list_outputs(values=True, units=True)
+        iter_count_after = driver.iter_count
+
+        for before, after in zip(inputs_before, inputs_after):
+            np.testing.assert_almost_equal(before[1]['value'], after[1]['value'])
+
+        for before, after in zip(outputs_before, outputs_after):
+            np.testing.assert_almost_equal(before[1]['value'], after[1]['value'])
+
+        # Should take one less iteration since we gave it a head start in the second run
+        self.assertEqual(iter_count_before, iter_count_after + 1)
+
+    def test_load_solver_cases(self):
+
+        prob = Problem()
+        model = prob.model
+
+        model.add_subsystem('px', IndepVarComp('x', 1.0), promotes=['x'])
+        model.add_subsystem('pz', IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
+        model.add_subsystem('d1', SellarDis1withDerivatives(), promotes=['x', 'z', 'y1', 'y2'])
+        model.add_subsystem('d2', SellarDis2withDerivatives(), promotes=['z', 'y1', 'y2'])
+        model.add_subsystem('obj_cmp', ExecComp('obj = x**2 + z[1] + y1 + exp(-y2)',
+                                                z=np.array([0.0, 0.0]), x=0.0),
+                            promotes=['obj', 'x', 'z', 'y1', 'y2'])
+        model.add_subsystem('con_cmp1', ExecComp('con1 = 3.16 - y1'), promotes=['con1', 'y1'])
+        model.add_subsystem('con_cmp2', ExecComp('con2 = y2 - 24.0'), promotes=['con2', 'y2'])
+
+        model.linear_solver = LinearBlockGS()
+        model.nonlinear_solver = NewtonSolver()
+        model.linear_solver.add_recorder(self.recorder)
+
+        prob.setup()
+        prob.run_model()
+        prob.cleanup()
+
+        cr = CaseReader(self.filename)
+        case = cr.solver_cases.get_case(0)
+
+        # Add one to all the inputs just to change the model
+        #   so we can see if loading the case values really changes the model
+        for name in prob.model._inputs:
+            prob.model._inputs[name] += 1.0
+        for name in prob.model._outputs:
+            prob.model._outputs[name] += 1.0
+
+        # Now load in the case we recorded
+        prob.load_case(case)
+
+        _assert_model_matches_case(case, model)
+
+    def test_load_driver_cases(self):
+
+        prob = Problem()
+        model = prob.model = Group()
+
+        model.add_subsystem('p1', IndepVarComp('x', 50.0), promotes=['*'])
+        model.add_subsystem('p2', IndepVarComp('y', 50.0), promotes=['*'])
+        model.add_subsystem('comp', Paraboloid(), promotes=['*'])
+        model.add_subsystem('con', ExecComp('c = x - y'), promotes=['*'])
+
+        prob.set_solver_print(level=0)
+
+        prob.driver = ScipyOptimizeDriver()
+        prob.driver.options['optimizer'] = 'SLSQP'
+        prob.driver.options['tol'] = 1e-9
+        prob.driver.options['disp'] = False
+
+        model.add_design_var('x', lower=-50.0, upper=50.0)
+        model.add_design_var('y', lower=-50.0, upper=50.0)
+
+        model.add_objective('f_xy')
+        model.add_constraint('c', lower=15.0)
+
+        prob.driver.add_recorder(self.recorder)
+
+        prob.setup(check=False)
+        prob.run_driver()
+        prob.cleanup()
+
+        cr = CaseReader(self.filename)
+        case = cr.driver_cases.get_case(0)
+
+        # Add one to all the inputs just to change the model
+        #   so we can see if loading the case values really changes the model
+        for name in prob.model._inputs:
+            prob.model._inputs[name] += 1.0
+        for name in prob.model._outputs:
+            prob.model._outputs[name] += 1.0
+
+        # Now load in the case we recorded
+        prob.load_case(case)
+
+        _assert_model_matches_case(case, model)
+
+    def test_system_options_pickle_fail(self):
+        # simple paraboloid model
+        model = Group()
+        ivc = IndepVarComp()
+        ivc.add_output('x', 3.0)
+        model.add_subsystem('subs', ivc)
+        subs = model.subs
+
+        # declare two options
+        subs.options.declare('options value 1', 1)
+        # Given object which can't be pickled
+        subs.options.declare('options value to fail', (i for i in []))
+        subs.add_recorder(self.recorder)
+
+        prob = Problem(model)
+        prob.setup()
+
+        with warnings.catch_warnings(record=True) as w:
+            prob.run_model()
+
+        prob.cleanup()
+        cr = CaseReader(self.filename)
+        subs_options = cr.system_metadata['subs']['component_options']
+
+        # no options should have been recorded for d1
+        self.assertEqual(len(subs_options._dict), 0)
+
+        # make sure we got the warning we expected
+        self.assertEqual(len(w), 1)
+        self.assertTrue(issubclass(w[0].category, RuntimeWarning))
+
+
+def _assert_model_matches_case(case, system):
+    '''
+    Check to see if the values in the case match those in the model.
+
+    Parameters
+    ----------
+    case : Case object
+        Case to be used for the comparison.
+    system : System object
+        System to be used for the comparison.
+    '''
+    case_inputs = case.inputs._values
+    model_inputs = system._inputs
+    for name, model_input in iteritems(model_inputs._views):
+        np.testing.assert_almost_equal(case_inputs[name],model_input)
+
+    case_outputs = case.outputs._values
+    model_outputs = system._outputs
+    for name, model_output in iteritems(model_outputs._views):
+        np.testing.assert_almost_equal(case_outputs[name],model_output)
 
 
 if __name__ == "__main__":

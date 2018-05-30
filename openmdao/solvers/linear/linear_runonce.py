@@ -13,6 +13,17 @@ class LinearRunOnce(LinearBlockGS):
 
     SOLVER = 'LN: RUNONCE'
 
+    def __init__(self, **kwargs):
+        """
+        Initialize all attributes.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Options dictionary.
+        """
+        super(LinearRunOnce, self).__init__(**kwargs)
+
     def solve(self, vec_names, mode, rel_systems=None):
         """
         Run the solver.
@@ -66,7 +77,11 @@ class LinearRunOnce(LinearBlockGS):
         """
         Declare options before kwargs are processed in the init method.
         """
-        # changing the default maxiter from the base class
-        self.options.declare('maxiter', default=0, values=(0,),
-                             desc='maximum number of iterations '
-                                  '(this solver does not iterate)')
+        # Remove unused options from base options here, so that users
+        # attempting to set them will get KeyErrors.
+        self.options.undeclare("atol")
+        self.options.undeclare("rtol")
+
+        # this solver does not iterate
+        self.options.undeclare("maxiter")
+        self.options.undeclare("err_on_maxiter")

@@ -5,6 +5,7 @@ import os
 import json
 from collections import OrderedDict
 import pprint
+import sys
 import warnings
 
 from six import iteritems, itervalues, string_types
@@ -54,8 +55,6 @@ class Driver(object):
         Reports whether the driver ran successfully.
     iter_count : int
         Keep track of iterations for case recording.
-    metadata : list
-        List of metadata
     options : <OptionsDictionary>
         Dictionary with general pyoptsparse options.
     recording_options : <OptionsDictionary>
@@ -104,9 +103,14 @@ class Driver(object):
         Cached total jacobian handling object.
     """
 
-    def __init__(self):
+    def __init__(self, **kwargs):
         """
         Initialize the driver.
+
+        Parameters
+        ----------
+        **kwargs : dict of keyword arguments
+            Keyword arguments that will be mapped into the Driver options.
         """
         self._rec_mgr = RecordingManager()
         self._vars_to_record = {
@@ -122,19 +126,21 @@ class Driver(object):
         self._cons = None
         self._objs = None
         self._responses = None
-        self.options = OptionsDictionary()
-        self.recording_options = OptionsDictionary()
 
-        ###########################
+        # Driver options
+        self.options = OptionsDictionary()
+
         self.options.declare('debug_print', types=list, is_valid=_is_debug_print_opts_valid,
                              desc="List of what type of Driver variables to print at each "
                                   "iteration. Valid items in list are 'desvars', 'ln_cons', "
-                                  "'nl_cons', 'objs'",
+                                  "'nl_cons', 'objs', 'totals'",
                              default=[])
 
-        ###########################
-        self.recording_options.declare('record_metadata', types=bool, desc='Record metadata',
-                                       default=True)
+        # Case recording options
+        self.recording_options = OptionsDictionary()
+
+        self.recording_options.declare('record_metadata', types=bool, default=True,
+                                       desc='Record metadata')
         self.recording_options.declare('record_desvars', types=bool, default=True,
                                        desc='Set to True to record design variables at the '
                                             'driver level')
@@ -155,6 +161,9 @@ class Driver(object):
                                             'level')
         self.recording_options.declare('record_inputs', types=bool, default=True,
                                        desc='Set to True to record inputs at the driver level')
+        self.recording_options.declare('record_n2_data', types=bool, default=True,
+                                       desc='Set to True to record metadata required for '
+                                       'N^2 viewing')
 
         # What the driver supports.
         self.supports = OptionsDictionary()
@@ -168,14 +177,12 @@ class Driver(object):
         self.supports.declare('active_set', types=bool, default=False)
         self.supports.declare('simultaneous_derivatives', types=bool, default=False)
         self.supports.declare('total_jac_sparsity', types=bool, default=False)
-
-        self.iter_count = 0
-        self.metadata = None
-        self._model_viewer_data = None
-        self.cite = ""
-
         # TODO, support these in OpenMDAO
         self.supports.declare('integer_design_vars', types=bool, default=False)
+
+        self.iter_count = 0
+        self._model_viewer_data = None
+        self.cite = ""
 
         self._simul_coloring_info = None
         self._total_jac_sparsity = None
@@ -183,6 +190,9 @@ class Driver(object):
         self._total_jac = None
 
         self.fail = False
+
+        self._declare_options()
+        self.options.update(kwargs)
 
     def add_recorder(self, recorder):
         """
@@ -200,6 +210,14 @@ class Driver(object):
         Clean up resources prior to exit.
         """
         self._rec_mgr.close()
+
+    def _declare_options(self):
+        """
+        Declare options before kwargs are processed in the init method.
+
+        This is optionally implemented by subclasses of Driver.
+        """
+        pass
 
     def _setup_comm(self, comm):
         """
@@ -417,10 +435,11 @@ class Driver(object):
         }
 
         self._rec_mgr.startup(self)
-        if self._rec_mgr._recorders:
-            from openmdao.devtools.problem_viewer.problem_viewer import _get_viewer_data
-            self._model_viewer_data = _get_viewer_data(problem)
         if self.recording_options['record_metadata']:
+            if self.recording_options['record_n2_data']:
+                if self._rec_mgr._recorders:
+                    from openmdao.devtools.problem_viewer.problem_viewer import _get_viewer_data
+                    self._model_viewer_data = _get_viewer_data(problem)
             self._rec_mgr.record_metadata(self)
 
     def _get_voi_val(self, name, meta, remote_vois, unscaled=False, ignore_indices=False):
@@ -985,6 +1004,8 @@ class Driver(object):
                     print("None")
                 print()
 
+        sys.stdout.flush()
+
     def _post_run_model_debug_print(self):
         """
         Optionally print some debugging information after the model runs.
@@ -1018,6 +1039,8 @@ class Driver(object):
                 else:
                     print("None")
                 print()
+
+        sys.stdout.flush()
 
 
 class RecordingDebugging(Recording):
