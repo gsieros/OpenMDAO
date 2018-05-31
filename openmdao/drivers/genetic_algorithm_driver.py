@@ -323,8 +323,11 @@ class GeneticAlgorithm():
 
         # TODO: from an user-supplied intial population
         # new_gen, lchrom = encode(x0, vlb, vub, bits)
-        new_gen = np.round(lhs(self.lchrom, self.npop, criterion='center',
+        if self.comm is None or self.comm.rank == 0:
+            new_gen = np.round(lhs(self.lchrom, self.npop, criterion='center',
                                random_state=random_state))
+        if self.comm is not None:
+            self.comm.bcast(new_gen, root=0)
 
         # Main Loop
         nfit = 0
@@ -384,9 +387,13 @@ class GeneticAlgorithm():
                 xopt = min_x
 
             # Evolve new generation.
-            new_gen = self.tournament(old_gen, fitness)
-            new_gen = self.crossover(new_gen, Pc)
-            new_gen = self.mutate(new_gen, Pm)
+            # On rank 0
+            if self.comm is None or self.comm.rank == 0:
+                new_gen = self.tournament(old_gen, fitness)
+                new_gen = self.crossover(new_gen, Pc)
+                new_gen = self.mutate(new_gen, Pm)
+            if self.comm is not None:
+                self.comm.bcast(new_gen, root=0)
 
         return xopt, fopt, nfit
 
